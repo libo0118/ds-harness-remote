@@ -1,6 +1,6 @@
 name: HarmonyOS HAP
 
-# SDK jobs run only when a maintainer dispatches reviewed code or creates a release tag.
+# Unsigned builds use disposable GitHub runners; signing stays on trusted self-hosted runners.
 # Do not run untrusted fork pull requests on a self-hosted runner.
 on:
   workflow_dispatch:
@@ -24,7 +24,7 @@ permissions:
 jobs:
   hap:
     name: Build HAP with HarmonyOS SDK
-    runs-on: [self-hosted, harmonyos]
+    runs-on: ${{ (github.event_name == 'push' || inputs.signed) && fromJSON('["self-hosted", "harmonyos"]') || 'ubuntu-latest' }}
     timeout-minutes: 30
     defaults:
       run:
@@ -35,12 +35,33 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Verify SDK mirror release reference
+        if: github.event_name == 'workflow_dispatch' && !inputs.signed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          actual=$(gh api repos/ErBWs/ohos-sdk/git/ref/tags/26.0.0.821 --jq '.object.sha')
+          test "$actual" = '8b294a949bdf7191e1a7ffa878be748c9032983b'
+
+      - name: Set up pinned HarmonyOS CLI tools
+        if: github.event_name == 'workflow_dispatch' && !inputs.signed
+        uses: ErBWs/setup-ohos@4dbb63025116eb6165ceac58a4bf47cbdc5ac721
+        with:
+          version: '26.0.0.821'
+          cache: 'true'
+
       - name: Verify the HarmonyOS toolchain
         run: |
           command -v hvigorw
           command -v ohpm
           hvigorw --version
           node --version
+          python3 --version
+
+      - name: Check HarmonyOS resources and version
+        run: |
+          node scripts/check-i18n.mjs
+          node scripts/bump-version.mjs --check
 
       - name: Install HarmonyOS dependencies
         run: ohpm install --all
@@ -62,17 +83,67 @@ jobs:
           umask 077
           node scripts/inject-signing.mjs
 
-      - name: Build HAP
+      - name: Build HAP and APP
         env:
           BUILD_MODE: ${{ inputs.build_mode || 'release' }}
-        run: hvigorw --no-daemon assembleHap -p product=default -p buildMode="$BUILD_MODE"
+        run: hvigorw --mode project --no-daemon assembleApp -p product=default -p buildMode="$BUILD_MODE" --stacktrace
+
+      - name: Verify packages and record build provenance
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          BUILD_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import io
+          import json
+          import os
+          import zipfile
+          from pathlib import Path
+
+          app = json.loads(Path('AppScope/app.json5').read_text())['app']
+          modules = {module['name'] for module in json.loads(Path('build-profile.json5').read_text())['modules']}
+
+          def verify_module(data):
+              with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                  assert archive.testzip() is None, 'Module CRC check failed'
+                  for name in ('module.json', 'ets/modules.abc', 'resources.index'):
+                      assert archive.getinfo(name).file_size > 0, f'Empty module file: {name}'
+                  manifest = json.loads(archive.read('module.json'))
+                  for key in ('bundleName', 'versionCode', 'versionName'):
+                      assert manifest['app'][key] == app[key], f'Application identity mismatch: {key}'
+                  return manifest['module']['name']
+
+          packages = sorted(Path('entry/build/default/outputs/default').glob('*.hap'))
+          apps = sorted(Path('build/outputs').rglob('*.app'))
+          assert packages and apps, 'Missing HAP or APP output'
+          assert {verify_module(path.read_bytes()) for path in packages} == modules, 'HAP module set mismatch'
+          for path in apps:
+              with zipfile.ZipFile(path) as archive:
+                  assert archive.testzip() is None, f'APP CRC check failed: {path}'
+                  bundled = {verify_module(archive.read(name)) for name in archive.namelist()
+                             if Path(name).suffix in ('.hap', '.hsp')}
+                  assert bundled == modules, f'APP module set mismatch: {bundled}'
+          outputs = packages + apps
+          Path('SHA256SUMS.txt').write_text(''.join(
+              f'{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.as_posix()}\n' for path in outputs))
+          info = dict(app, sourceCommit=os.environ['SOURCE_SHA'], runUrl=os.environ['BUILD_RUN_URL'],
+                      sdkTarget=json.loads(Path('build-profile.json5').read_text())['app']['products'][0]['targetSdkVersion'])
+          Path('build-info.json').write_text(json.dumps(info, indent=2) + '\n')
+          print(f'Verified {len(packages)} HAP and {len(apps)} APP; modules={sorted(modules)}')
+          PY
 
       - name: Upload HAP artifact
         uses: actions/upload-artifact@v4
         with:
           name: harmony-hap
-          path: apps/harmony/entry/build/default/outputs/default/*.hap
+          path: |
+            apps/harmony/entry/build/default/outputs/default/*.hap
+            apps/harmony/build/outputs/**/*.app
+            apps/harmony/SHA256SUMS.txt
+            apps/harmony/build-info.json
           if-no-files-found: error
+          retention-days: 14
 
       - name: Remove signing material and restore profile
         if: always()

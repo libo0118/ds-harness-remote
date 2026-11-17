@@ -65,7 +65,9 @@ apps/harmony/scripts/smoke.sh <hdc-device-id>
 
 签名材料不得提交。复制 `build-profile.json5` 为被忽略的 `build-profile.local.json5`，通过 DevEco Studio 配置本机签名。`scripts/build-local.sh` 会临时使用该文件，结束时还原原配置；设置 `HVIGORW` 可指定构建命令路径。
 
-`.github/workflows/harmony-hap.yml` 提供手动构建（默认未签名）和 `harmony-v*` 标签签名构建，需要安装 SDK、带 `self-hosted` / `harmonyos` 标签的 runner。它不自动执行 fork PR 的代码。手动构建目标分支前须审查代码；签名构建只针对可信代码。
+`.github/workflows/harmony-hap.yml` 提供手动构建（默认未签名）和 `harmony-v*` 标签签名构建。未签名构建在 GitHub 托管的 Ubuntu runner 上安装固定版本 `26.0.0.821` 工具链；签名构建仍要求安装 SDK、Python 3 且带 `self-hosted` / `harmonyos` 标签的 runner。它不自动执行 fork PR 的代码。手动构建目标分支前须审查代码；签名构建只针对可信代码。
+
+CI 组装 HAP 与完整 APP，校验包 CRC、非空运行资源、应用身份与模块集合，再上传产物、`SHA256SUMS.txt` 和 `build-info.json`，保留 14 天。未签名产物仍需适用的证书与设备 profile 才能安装。
 
 签名任务由以下仓库 Secrets 注入，缺失或不完整时必须失败：
 
